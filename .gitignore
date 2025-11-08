@@ -9,4 +9,5 @@ data/processed/
 .notebooks_cache/
 .ipynb_checkpoints/
 .DS_Store
+.cache/pd_voice/
 
