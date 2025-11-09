@@ -12,28 +12,24 @@ This repository implements a fully automated, research-grade Parkinson's voice d
 > **Clinical notice**: This project is for research and educational purposes only. It is **not** a medical device, diagnostic tool, or substitute for professional care.
 
 ## Project structure
-``text
+```text
 parkinson_voice_predictor/
-+-- artifacts/                  # Saved scaler/model/metrics (gitignored)
-+-- data/                       # Raw + processed data (gitignored)
-+-- notebooks/                  # Optional research notebooks
-+-- src/pd_voice/               # Core library
-¦   +-- audio_processing.py     # Preprocessing & augmentations
-¦   +-- config.py               # Global configuration and Figshare wiring
-¦   +-- data_utils.py           # Download/extract + metadata parsing
-¦   +-- embeddings.py           # Dual SSL feature extractor
-¦   +-- inference.py            # Calibrated inference helper
-¦   +-- training.py             # Training orchestration + persistence
-¦   +-- __init__.py
-+-- train.py                    # CLI entry point for training
-+-- predict.py                  # CLI entry point for inference
-+-- requirements.txt
-+-- README.md
-``
++-- backend/                   # Python training + inference service
+|   +-- api_server.py          # FastAPI entry point (uvicorn runner)
+|   +-- requirements.txt       # Backend dependencies
+|   +-- train.py / predict.py  # CLI utilities
+|   +-- data/, artifacts/      # Raw + processed assets (gitignored)
+|   +-- src/pd_voice/          # Core library (processing, embeddings, training, API)
++-- frontend/                  # Next.js + ShadCN dashboard
+    +-- app/, components/, lib/
+    +-- package.json, tsconfig.json, etc.
+    +-- public/, styles/, types/
+```
 
-## Environment setup
-1. **Create a virtual environment (Python 3.12+):**
+## Backend environment setup
+1. **Enter the backend workspace (Python 3.12+):**
    `powershell
+   cd backend
    python -m venv .venv
    .\.venv\Scripts\activate
    `
@@ -44,8 +40,9 @@ parkinson_voice_predictor/
    `
 
 ## Training pipeline
-All steps (download ? preprocessing ? SSL embeddings ? CV ? calibration ? artifact export) are wrapped in 	rain.py:
+All steps (download  preprocessing  SSL embeddings  CV  calibration  artifact export) live inside `backend/train.py`.
 `powershell
+cd backend
 python train.py \
   --augmentations-per-clip 2 \
   --min-duration 3.0 \
@@ -56,23 +53,24 @@ python train.py \
 `
 
 Key behaviors:
-- **Dataset management**: Files are fetched directly from Figshare via the REST API, checksum-verified, and extracted into data/raw/{PD_AH,HC_AH} with demographics preserved.
-- **Preprocessing**: 16 kHz mono, silence trim (35 dB threshold), spectral noise suppression, -20 dBFS loudness targeting, bounded duration (3–8 s).
+- **Dataset management**: Files are fetched directly from Figshare via the REST API, checksum-verified, and extracted into `backend/data/raw/{PD_AH,HC_AH}` with demographics preserved.
+- **Preprocessing**: 16 kHz mono, silence trim (35 dB threshold), spectral noise suppression, -20 dBFS loudness targeting, bounded duration (38 s).
 - **Augmentation**: Two stochastic variants per utterance (Gaussian noise, gain, pitch ±2 semitones, temporal shift, clipping distortion) to bolster robustness.
 - **Embeddings**: Mean-pooled hidden states from Wav2Vec2-Base and WavLM-Base-Plus are concatenated, producing 1536-dim biomarkers per clip.
-- **Modeling**: StandardScaler ? XGBoost (600 trees, depth 8, lr 0.03, subsample 0.9) ? CalibratedClassifierCV(sigmoid, 5 folds).
-- **Evaluation**: 5-fold CV metrics (accuracy/AUROC ± SD) + stratified 20% holdout report saved to rtifacts/holdout_metrics.json & rtifacts/cv_metrics.csv.
-- **Persistence**: rtifacts/pd_voice_fusion_calibrated.pkl, rtifacts/scaler.pkl, rtifacts/metadata.csv (sample lineage, augment flags, demographics, split).
+- **Modeling**: StandardScaler  XGBoost (600 trees, depth 8, lr 0.03, subsample 0.9)  CalibratedClassifierCV(sigmoid, 5 folds).
+- **Evaluation**: 5-fold CV metrics (accuracy/AUROC ± SD) + stratified 20% holdout report saved to `backend/artifacts/holdout_metrics.json` & `backend/artifacts/cv_metrics.csv`.
+- **Persistence**: `backend/artifacts/pd_voice_fusion_calibrated.pkl`, `backend/artifacts/scaler.pkl`, `backend/artifacts/metadata.csv` (sample lineage, augment flags, demographics, split).
 
-> **Tip**: SSL model downloads (~1.3?GB total) the first time you run training/inference. Hugging Face caches them under .cache/pd_voice for reuse.
+> **Tip**: SSL model downloads (~1.3 GB total) the first time you run training/inference. Hugging Face caches them under `backend/.cache/pd_voice` for reuse.
 
 ## Inference
-After training, run calibrated inference on any mono 16 kHz .wav of sustained vowel phonation:
+After training, run calibrated inference on any mono 16 kHz .wav of sustained vowel phonation from inside `backend/`:
 `powershell
+cd backend
 python predict.py path\to\audio.wav
 `
 
-Or call the helper function directly from Python:
+Or call the helper function directly from Python (with your backend virtualenv activated):
 `python
 from pd_voice import predict_voice
 print(predict_voice("/path/to/audio.wav"))
@@ -80,9 +78,38 @@ print(predict_voice("/path/to/audio.wav"))
 `
 
 Probabilities map to risk bands used in the accompanying report:
-- <10% ? **low**
-- 10–30% ? **borderline**
-- >30% ? **elevated**
+- <10%  **low**
+- 1030%  **borderline**
+- >30%  **elevated**
+
+## FastAPI service
+Run the REST API that powers the dashboard and external integrations from the backend workspace.
+
+```bash
+cd backend
+pip install -r requirements.txt   # if you haven't already
+python api_server.py
+```
+
+Endpoints:
+- `GET /health` - uptime probe.
+- `POST /predict` - upload (`file`) and receive calibrated PD probability, risk band, spectrogram heatmap, and confidence.
+- `POST /train` - reruns the full training pipeline and refreshes artifacts + insights JSON.
+- `GET /insights` - returns dashboard-ready metrics (CV folds, ROC/PR curves, calibration, demographics, etc.).
+
+## Frontend dashboard (Next.js + ShadCN)
+A client experience for uploading phonations, monitoring inference confidence, exporting PDF summaries, and visualizing diagnostics.
+
+```bash
+cd frontend
+npm install            # already run once, repeat after pulling
+cp .env.example .env.local
+# Update NEXT_PUBLIC_API_BASE_URL if the FastAPI server uses a different host/port
+npm run dev
+```
+
+Visit http://localhost:3000 after both the frontend dev server and FastAPI backend are running.
+The UI uses ShadCN primitives; add more components via `npx shadcn@latest add <component>`.
 
 ## Reproducibility & transparency
 - Deterministic seeds (42) are applied to data splits, numpy RNG, and augmentation pipelines; set --seed to regenerate splits.
