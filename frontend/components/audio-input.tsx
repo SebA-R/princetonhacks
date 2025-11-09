@@ -10,6 +10,12 @@ import { InteractiveWaveform } from "@/components/interactive-waveform"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { predictVoice } from "@/lib/api"
 
+declare global {
+  interface Window {
+    webkitAudioContext?: typeof AudioContext
+  }
+}
+
 interface AudioInputProps {
   onAnalysisStart: () => void
   onAnalysisComplete: (data: {
@@ -37,8 +43,12 @@ export function AudioInput({
   const [audioUrl, setAudioUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const chunksRef = useRef<Blob[]>([])
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const floatChunksRef = useRef<Float32Array[]>([])
+  const sampleRateRef = useRef(16000)
 
   useEffect(() => {
     return () => {
@@ -64,27 +74,28 @@ export function AudioInput({
           autoGainControl: true,
         },
       })
+      streamRef.current = stream
+      floatChunksRef.current = []
 
-      const mediaRecorder = new MediaRecorder(stream)
-      mediaRecorderRef.current = mediaRecorder
-      chunksRef.current = []
+      const AudioCtx = window.AudioContext || window.webkitAudioContext
+      if (!AudioCtx) {
+        setError("Your browser does not support the Web Audio API.")
+        return
+      }
+      const audioContext = new AudioCtx()
+      audioContextRef.current = audioContext
+      sampleRateRef.current = audioContext.sampleRate ?? 44100
+      const source = audioContext.createMediaStreamSource(stream)
+      sourceRef.current = source
+      const processor = audioContext.createScriptProcessor(4096, 1, 1)
+      processorRef.current = processor
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          chunksRef.current.push(e.data)
-        }
+      processor.onaudioprocess = (event) => {
+        floatChunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)))
       }
 
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" })
-        const file = new File([blob], "recording.webm", { type: "audio/webm" })
-        setAudioFile(file)
-        const url = URL.createObjectURL(blob)
-        setAudioUrl(url)
-        stream.getTracks().forEach((track) => track.stop())
-      }
-
-      mediaRecorder.start()
+      source.connect(processor)
+      processor.connect(audioContext.destination)
       setIsRecording(true)
     } catch (err: any) {
       console.error("[v0] Error accessing microphone:", err)
@@ -104,10 +115,36 @@ export function AudioInput({
   }
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop()
+    if (!isRecording) return
+    processorRef.current?.disconnect()
+    sourceRef.current?.disconnect()
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    audioContextRef.current?.close()
+
+    processorRef.current = null
+    sourceRef.current = null
+    streamRef.current = null
+    audioContextRef.current = null
+
+    const captured = flattenFloat32(floatChunksRef.current)
+    floatChunksRef.current = []
+    if (!captured.length) {
+      setError("No audio captured. Please try again.")
       setIsRecording(false)
+      return
     }
+
+    const targetRate = 16000
+    const resampled = downsampleBuffer(captured, sampleRateRef.current ?? targetRate, targetRate)
+    const wavBlob = encodeWav(resampled, targetRate)
+    const file = new File([wavBlob], "recording.wav", { type: "audio/wav" })
+    setAudioFile(file)
+    if (audioUrl) {
+      URL.revokeObjectURL(audioUrl)
+    }
+    const url = URL.createObjectURL(wavBlob)
+    setAudioUrl(url)
+    setIsRecording(false)
   }
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -266,4 +303,85 @@ export function AudioInput({
       </CardContent>
     </Card>
   )
+}
+
+function flattenFloat32(chunks: Float32Array[]): Float32Array {
+  if (!chunks.length) return new Float32Array()
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+  const result = new Float32Array(totalLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    result.set(chunk, offset)
+    offset += chunk.length
+  }
+  return result
+}
+
+function downsampleBuffer(buffer: Float32Array, originalRate: number, targetRate: number): Float32Array {
+  if (targetRate === originalRate) return buffer
+  const ratio = originalRate / targetRate
+  const newLength = Math.round(buffer.length / ratio)
+  const result = new Float32Array(newLength)
+  let offsetResult = 0
+  let offsetBuffer = 0
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio)
+    let accum = 0
+    let count = 0
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i]
+      count++
+    }
+    result[offsetResult] = accum / count
+    offsetResult++
+    offsetBuffer = nextOffsetBuffer
+  }
+  return result
+}
+
+function encodeWav(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buffer)
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i))
+    }
+  }
+
+  let offset = 0
+
+  writeString(offset, "RIFF")
+  offset += 4
+  view.setUint32(offset, 36 + samples.length * 2, true)
+  offset += 4
+  writeString(offset, "WAVE")
+  offset += 4
+  writeString(offset, "fmt ")
+  offset += 4
+  view.setUint32(offset, 16, true)
+  offset += 4
+  view.setUint16(offset, 1, true)
+  offset += 2
+  view.setUint16(offset, 1, true)
+  offset += 2
+  view.setUint32(offset, sampleRate, true)
+  offset += 4
+  view.setUint32(offset, sampleRate * 2, true)
+  offset += 4
+  view.setUint16(offset, 2, true)
+  offset += 2
+  view.setUint16(offset, 16, true)
+  offset += 2
+  writeString(offset, "data")
+  offset += 4
+  view.setUint32(offset, samples.length * 2, true)
+  offset += 4
+
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+  }
+
+  return new Blob([buffer], { type: "audio/wav" })
 }

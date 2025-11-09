@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -8,17 +9,22 @@ from typing import Any, Dict, List, Tuple
 import joblib
 import numpy as np
 import pandas as pd
+from pydub import AudioSegment
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_recall_curve, roc_curve
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 import xgboost as xgb
 
 from .audio_processing import augment_waveform, preprocess_audio
 from .config import CONFIG, TrainingConfig
 from .data_utils import SampleRecord, collect_audio_samples
 from .embeddings import SSLFeatureExtractor
+from .features import compute_acoustic_features
 
 
 @dataclass
@@ -34,11 +40,31 @@ class PreparedExample:
     sex: str | None = None
 
 
+def apply_compression_artifact(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
+    clipped = np.clip(waveform, -1.0, 1.0)
+    int16_audio = (clipped * 32767).astype(np.int16)
+    segment = AudioSegment(
+        data=int16_audio.tobytes(),
+        frame_rate=sample_rate,
+        sample_width=2,
+        channels=1,
+    )
+    buffer = io.BytesIO()
+    segment.export(buffer, format="ogg", codec="libopus", bitrate="48k")
+    buffer.seek(0)
+    degraded = AudioSegment.from_file(buffer, format="ogg")
+    degraded = degraded.set_frame_rate(sample_rate).set_channels(1)
+    samples = np.array(degraded.get_array_of_samples()).astype(np.float32)
+    samples /= 32768.0
+    return samples
+
+
 def expand_with_augmentations(
     samples: List[SampleRecord],
     config: TrainingConfig = CONFIG,
 ) -> List[PreparedExample]:
-    rng = np.random.default_rng(None if config.stochastic_augmentations else config.random_seed)
+    seed = None if config.stochastic_augmentations else config.augmentation_seed
+    rng = np.random.default_rng(seed)
     prepared: List[PreparedExample] = []
     for sample in samples:
         waveform = preprocess_audio(str(sample.filepath), config=config, rng=rng)
@@ -53,6 +79,21 @@ def expand_with_augmentations(
                 sex=sample.sex,
             )
         )
+        if config.simulate_compression:
+            compressed = apply_compression_artifact(waveform, config.sample_rate)
+            prepared.append(
+                PreparedExample(
+                    sample_id=f"{sample.sample_id}_comp",
+                    label=sample.label,
+                    waveform=compressed,
+                    cohort=sample.cohort,
+                    source_path=sample.filepath,
+                    is_augmented=True,
+                    augmentation_id=-1,
+                    age=sample.age,
+                    sex=sample.sex,
+                )
+            )
         for aug_idx in range(config.augmentation_per_clip):
             augmented = augment_waveform(waveform, sample_rate=config.sample_rate, rng=rng)
             prepared.append(
@@ -79,7 +120,16 @@ def build_feature_matrix(
     labels = np.array([example.label for example in prepared], dtype=np.int64)
     metadata_records = []
     features = extractor.transform(waveforms, batch_size=4)
+    acoustic_features: List[np.ndarray] = []
+    acoustic_labels: List[str] | None = None
     for idx, example in enumerate(prepared):
+        ac_values, ac_labels = compute_acoustic_features(
+            example.waveform,
+            extractor.config.sample_rate,
+        )
+        acoustic_features.append(ac_values)
+        if acoustic_labels is None:
+            acoustic_labels = ac_labels
         metadata_records.append(
             {
                 "row_id": idx,
@@ -96,7 +146,14 @@ def build_feature_matrix(
             }
         )
     metadata = pd.DataFrame(metadata_records).reset_index(drop=True)
-    return features, labels, metadata, extractor.get_feature_labels()
+    if acoustic_features:
+        acoustic_matrix = np.vstack(acoustic_features)
+        features = np.hstack([features, acoustic_matrix])
+        acoustic_labels = acoustic_labels or []
+        feature_labels = extractor.get_feature_labels() + acoustic_labels
+    else:
+        feature_labels = extractor.get_feature_labels()
+    return features, labels, metadata, feature_labels
 
 
 def _compute_scale_pos_weight(labels: np.ndarray) -> float | None:
@@ -107,18 +164,71 @@ def _compute_scale_pos_weight(labels: np.ndarray) -> float | None:
     return neg / pos
 
 
+def _build_group_index(
+    groups: np.ndarray,
+    labels: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, Dict[Any, np.ndarray]]:
+    """Group sample indices and labels by their parent sample id."""
+    group_to_indices: Dict[Any, List[int]] = {}
+    ordered_groups: List[Any] = []
+    for idx, group in enumerate(groups):
+        if group not in group_to_indices:
+            group_to_indices[group] = []
+            ordered_groups.append(group)
+        group_to_indices[group].append(idx)
+    group_labels: List[int] = []
+    for group in ordered_groups:
+        idxs = group_to_indices[group]
+        label = int(labels[idxs[0]])
+        if not np.all(labels[idxs] == label):
+            raise ValueError(f"Inconsistent labels detected within group '{group}'.")
+        group_labels.append(label)
+    index_arrays = {group: np.array(indices, dtype=np.int64) for group, indices in group_to_indices.items()}
+    return np.array(ordered_groups, dtype=object), np.array(group_labels, dtype=np.int64), index_arrays
+
+
+def _expand_groups(
+    selected_groups: np.ndarray,
+    group_index: Dict[Any, np.ndarray],
+) -> np.ndarray:
+    """Flatten indices for a collection of parent groups."""
+    indices = [group_index[group] for group in selected_groups]
+    if len(indices) == 1:
+        return indices[0].copy()
+    return np.concatenate(indices)
+
+
 def _init_classifier(
     config: TrainingConfig,
     seed: int,
     scale_pos_weight: float | None = None,
 ) -> xgb.XGBClassifier:
+    if config.model_type.lower() == "svm":
+        return SVC(
+            C=config.svm_c,
+            gamma=config.svm_gamma,
+            kernel="rbf",
+            probability=True,
+            class_weight="balanced",
+            random_state=seed,
+        )
+    if config.model_type.lower() == "logistic":
+        return LogisticRegression(
+            penalty="l2",
+            C=config.logreg_c,
+            class_weight="balanced",
+            solver="liblinear",
+            max_iter=2000,
+            random_state=seed,
+        )
     return xgb.XGBClassifier(
         n_estimators=config.xgb_n_estimators,
         max_depth=config.xgb_max_depth,
         learning_rate=config.xgb_learning_rate,
         subsample=config.xgb_subsample,
         colsample_bytree=config.xgb_colsample_bytree,
-        reg_lambda=1.0,
+        reg_lambda=getattr(config, "xgb_reg_lambda", 1.0),
+        reg_alpha=getattr(config, "xgb_reg_alpha", 0.0),
         gamma=0.0,
         min_child_weight=config.xgb_min_child_weight,
         objective="binary:logistic",
@@ -130,23 +240,48 @@ def _init_classifier(
     )
 
 
+def _build_feature_pipeline(config: TrainingConfig) -> Pipeline:
+    steps: List[Tuple[str, Any]] = [("scaler", StandardScaler())]
+    if config.pca_variance is not None:
+        steps.append(
+            (
+                "pca",
+                PCA(
+                    n_components=config.pca_variance,
+                    random_state=config.random_seed,
+                ),
+            )
+        )
+    return Pipeline(steps)
+
+
 def cross_validate(
     X: np.ndarray,
     y: np.ndarray,
+    groups: np.ndarray,
     config: TrainingConfig = CONFIG,
     scale_pos_weight: float | None = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    group_names, group_labels, group_to_indices = _build_group_index(groups, y)
+    if len(group_names) < 2:
+        raise ValueError("Need at least two unique parent samples for cross-validation.")
+    n_splits = min(config.cv_folds, len(group_names))
     skf = StratifiedKFold(
-        n_splits=config.cv_folds,
+        n_splits=n_splits,
         shuffle=True,
         random_state=config.random_seed,
     )
     rows = []
     diagnostics: List[Dict[str, Any]] = []
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), start=1):
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X[train_idx])
-        X_val = scaler.transform(X[val_idx])
+    dummy = np.zeros(len(group_names))
+    for fold, (train_group_idx, val_group_idx) in enumerate(skf.split(dummy, group_labels), start=1):
+        train_groups = group_names[train_group_idx]
+        val_groups = group_names[val_group_idx]
+        train_idx = _expand_groups(train_groups, group_to_indices)
+        val_idx = _expand_groups(val_groups, group_to_indices)
+        pipeline = _build_feature_pipeline(config)
+        X_train = pipeline.fit_transform(X[train_idx])
+        X_val = pipeline.transform(X[val_idx])
         clf = _init_classifier(
             config,
             seed=config.random_seed + fold,
@@ -177,6 +312,7 @@ def cross_validate(
 def train_final_model(
     X: np.ndarray,
     y: np.ndarray,
+    groups: np.ndarray,
     config: TrainingConfig = CONFIG,
     scale_pos_weight: float | None = None,
 ) -> Tuple[
@@ -188,18 +324,25 @@ def train_final_model(
     Dict[str, Any],
     List[float],
 ]:
-    indices = np.arange(len(y))
-    train_idx, holdout_idx = train_test_split(
-        indices,
+    group_names, group_labels, group_to_indices = _build_group_index(groups, y)
+    if len(group_names) < 2:
+        raise ValueError("Need at least two unique parent samples for train/holdout split.")
+    splitter = StratifiedShuffleSplit(
+        n_splits=1,
         test_size=config.test_size,
-        stratify=y,
         random_state=config.random_seed,
     )
+    dummy = np.zeros(len(group_names))
+    train_groups_idx, holdout_groups_idx = next(splitter.split(dummy, group_labels))
+    train_groups = group_names[train_groups_idx]
+    holdout_groups = group_names[holdout_groups_idx]
+    train_idx = np.sort(_expand_groups(train_groups, group_to_indices))
+    holdout_idx = np.sort(_expand_groups(holdout_groups, group_to_indices))
     X_train, X_holdout = X[train_idx], X[holdout_idx]
     y_train, y_holdout = y[train_idx], y[holdout_idx]
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_holdout_scaled = scaler.transform(X_holdout)
+    feature_pipeline = _build_feature_pipeline(config)
+    X_train_scaled = feature_pipeline.fit_transform(X_train)
+    X_holdout_scaled = feature_pipeline.transform(X_holdout)
     base_clf = _init_classifier(
         config,
         seed=config.random_seed,
@@ -224,10 +367,17 @@ def train_final_model(
         scale_pos_weight=scale_pos_weight,
     )
     importance_model.fit(X_train_scaled, y_train)
-    feature_importances = importance_model.feature_importances_.tolist()
+    if hasattr(importance_model, "feature_importances_"):
+        feature_importances = importance_model.feature_importances_.tolist()
+    elif hasattr(importance_model, "coef_"):
+        coefficients = np.abs(importance_model.coef_).ravel()
+        total = coefficients.sum() + 1e-12
+        feature_importances = (coefficients / total).tolist()
+    else:
+        feature_importances = (np.ones(X_train_scaled.shape[1]) / X_train_scaled.shape[1]).tolist()
     return (
         calibrated,
-        scaler,
+        feature_pipeline,
         metrics,
         train_idx,
         holdout_idx,
@@ -238,7 +388,7 @@ def train_final_model(
 
 def save_artifacts(
     model: CalibratedClassifierCV,
-    scaler: StandardScaler,
+    feature_pipeline: Pipeline,
     metadata: pd.DataFrame,
     cv_metrics: pd.DataFrame,
     holdout_metrics: Dict[str, float],
@@ -247,21 +397,21 @@ def save_artifacts(
 ) -> Dict[str, Path]:
     artifacts = {}
     model_path = config.artifacts_dir / "pd_voice_fusion_calibrated.pkl"
-    scaler_path = config.artifacts_dir / "scaler.pkl"
+    transformer_path = config.artifacts_dir / "feature_pipeline.pkl"
     metadata_path = config.artifacts_dir / "metadata.csv"
     cv_path = config.artifacts_dir / "cv_metrics.csv"
     metrics_path = config.artifacts_dir / "holdout_metrics.json"
     dashboard_path = config.artifacts_dir / "dashboard_insights.json"
 
     joblib.dump(model, model_path)
-    joblib.dump(scaler, scaler_path)
+    joblib.dump(feature_pipeline, transformer_path)
     metadata.to_csv(metadata_path, index=False)
     cv_metrics.to_csv(cv_path, index=False)
     pd.Series(holdout_metrics).to_json(metrics_path, indent=2)
     dashboard_path.write_text(json.dumps(dashboard_payload, indent=2))
 
     artifacts["model"] = model_path
-    artifacts["scaler"] = scaler_path
+    artifacts["feature_pipeline"] = transformer_path
     artifacts["metadata"] = metadata_path
     artifacts["cv_metrics"] = cv_path
     artifacts["holdout_metrics"] = metrics_path
@@ -434,10 +584,12 @@ def run_training_pipeline(config: TrainingConfig = CONFIG) -> Dict[str, Path]:
     prepared_examples = expand_with_augmentations(samples, config=config)
     extractor = SSLFeatureExtractor(config=config)
     features, labels, metadata, feature_names = build_feature_matrix(prepared_examples, extractor)
+    groups = metadata["parent_sample_id"].to_numpy()
     scale_pos_weight = _compute_scale_pos_weight(labels)
     cv_metrics, cv_curves = cross_validate(
         features,
         labels,
+        groups=groups,
         config=config,
         scale_pos_weight=scale_pos_weight,
     )
@@ -453,7 +605,7 @@ def run_training_pipeline(config: TrainingConfig = CONFIG) -> Dict[str, Path]:
     }
     (
         calibrated_model,
-        scaler,
+        feature_pipeline,
         holdout_metrics,
         train_idx,
         holdout_idx,
@@ -462,6 +614,7 @@ def run_training_pipeline(config: TrainingConfig = CONFIG) -> Dict[str, Path]:
     ) = train_final_model(
         features,
         labels,
+        groups=groups,
         config=config,
         scale_pos_weight=scale_pos_weight,
     )
@@ -481,7 +634,7 @@ def run_training_pipeline(config: TrainingConfig = CONFIG) -> Dict[str, Path]:
     )
     artifacts = save_artifacts(
         calibrated_model,
-        scaler,
+        feature_pipeline,
         metadata,
         cv_metrics,
         {**holdout_metrics, **summary},

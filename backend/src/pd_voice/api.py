@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import io
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -12,8 +13,9 @@ import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from pydub import AudioSegment
 
-from .config import TrainingConfig
+from .config import CONFIG, TrainingConfig
 from .inference import VoicePredictor
 from .training import run_training_pipeline
 
@@ -23,7 +25,7 @@ INSIGHTS_PATH = ARTIFACTS_DIR / "dashboard_insights.json"
 _STATE_LOCK = Lock()
 REQUIRED_ARTIFACTS = [
     ARTIFACTS_DIR / "pd_voice_fusion_calibrated.pkl",
-    ARTIFACTS_DIR / "scaler.pkl",
+    ARTIFACTS_DIR / "feature_pipeline.pkl",
     INSIGHTS_PATH,
 ]
 
@@ -143,14 +145,30 @@ async def health() -> Dict[str, str]:
 
 @app.post("/predict", response_model=PredictResponse)
 async def predict(file: UploadFile = File(...)) -> PredictResponse:
-    if not file.filename.lower().endswith((".wav", ".flac", ".mp3", ".m4a")):
-        raise HTTPException(status_code=400, detail="Audio file must be .wav, .flac, .mp3, or .m4a")
+    allowed_exts = (".wav", ".flac", ".mp3", ".m4a", ".webm", ".ogg")
+    original_suffix = Path(file.filename).suffix.lower()
+    if original_suffix not in allowed_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio file must be one of: {', '.join(allowed_exts)}",
+        )
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    suffix = Path(file.filename).suffix or ".wav"
+    suffix = ".wav"
+    try:
+        audio_segment = AudioSegment.from_file(
+            io.BytesIO(contents),
+            format=original_suffix.lstrip(".") or "wav",
+        )
+        audio_segment = audio_segment.set_frame_rate(CONFIG.sample_rate).set_channels(1)
+        buffer = io.BytesIO()
+        audio_segment.export(buffer, format="wav")
+        converted_bytes = buffer.getvalue()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to process audio: {exc}") from exc
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(contents)
+        tmp.write(converted_bytes)
         tmp_path = Path(tmp.name)
     try:
         result = get_predictor().predict(tmp_path, include_waveform=True)

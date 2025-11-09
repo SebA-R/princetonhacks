@@ -25,22 +25,32 @@ class TrainingConfig:
     processed_audio_dir: Path = Path("data/processed")
     cache_dir: Path = Path(".cache/pd_voice")
     article_id: int = 23849127
+    extra_hc_dirs: List[Path] = field(default_factory=lambda: [Path("data/raw/user_hc")])
     sample_rate: int = 16_000
     min_duration_sec: float = 3.0
     max_duration_sec: float = 8.0
-    augmentation_per_clip: int = 2
-    random_seed: int = 42
-    cv_folds: int = 5
-    test_size: float = 0.2
+    augmentation_per_clip: int = 3
+    augmentation_seed: int = 42
+    random_seed: int = 18
+    cv_folds: int = 10
+    test_size: float = 0.1
     top_db_trim: int = 35
     target_dbfs: float = -20.0
-    stochastic_augmentations: bool = True
+    stochastic_augmentations: bool = False
     xgb_n_estimators: int = 400
-    xgb_max_depth: int = 6
-    xgb_learning_rate: float = 0.05
-    xgb_min_child_weight: int = 3
-    xgb_subsample: float = 0.85
-    xgb_colsample_bytree: float = 0.85
+    xgb_max_depth: int = 4
+    xgb_learning_rate: float = 0.07
+    xgb_min_child_weight: int = 2
+    xgb_subsample: float = 0.9
+    xgb_colsample_bytree: float = 0.9
+    xgb_reg_lambda: float = 1.2
+    xgb_reg_alpha: float = 0.1
+    pca_variance: float | None = 0.97
+    model_type: str = "xgb"
+    svm_c: float = 3.0
+    svm_gamma: str | float = "scale"
+    logreg_c: float = 1.5
+    simulate_compression: bool = True
     ssl_models: List[str] = field(
         default_factory=lambda: [
             "facebook/wav2vec2-base",
@@ -53,6 +63,7 @@ class TrainingConfig:
         self.artifacts_dir = (self.base_dir / self.artifacts_dir).resolve()
         self.processed_audio_dir = (self.base_dir / self.processed_audio_dir).resolve()
         self.cache_dir = (self.base_dir / self.cache_dir).resolve()
+        self.extra_hc_dirs = [(self.base_dir / path).resolve() for path in self.extra_hc_dirs]
         for directory in [
             self.data_dir,
             self.artifacts_dir,
@@ -61,6 +72,8 @@ class TrainingConfig:
             self.raw_dir,
         ]:
             directory.mkdir(parents=True, exist_ok=True)
+        for custom_dir in self.extra_hc_dirs:
+            custom_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def raw_dir(self) -> Path:

@@ -139,6 +139,19 @@ def collect_audio_samples(config: TrainingConfig = CONFIG) -> List[SampleRecord]
                     cohort=cohort,
                 )
             )
+    for custom_dir in getattr(config, "extra_hc_dirs", []):
+        if not custom_dir.exists():
+            continue
+        for wav_path in sorted(custom_dir.rglob("*.wav")):
+            sample_id = f"user_{wav_path.stem}"
+            samples.append(
+                SampleRecord(
+                    sample_id=sample_id,
+                    filepath=wav_path,
+                    label=0,
+                    cohort="HC_CUSTOM",
+                )
+            )
     demographics = load_demographics(config.raw_dir / "Demographics_age_sex.xlsx")
     demo_map = demographics.set_index("sample_id").to_dict(orient="index")
     for sample in samples:

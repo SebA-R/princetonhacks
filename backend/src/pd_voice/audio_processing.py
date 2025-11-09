@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 import librosa
 import numpy as np

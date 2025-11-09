@@ -9,6 +9,7 @@ import numpy as np
 from .audio_processing import preprocess_audio
 from .config import CONFIG, TrainingConfig
 from .embeddings import SSLFeatureExtractor
+from .features import compute_acoustic_features
 
 
 def risk_band(probability: float) -> str:
@@ -30,19 +31,25 @@ class VoicePredictor:
         self.config = config
         self.artifacts_dir = Path(artifacts_dir or config.artifacts_dir)
         self.model_path = self.artifacts_dir / "pd_voice_fusion_calibrated.pkl"
-        self.scaler_path = self.artifacts_dir / "scaler.pkl"
-        if not self.model_path.exists() or not self.scaler_path.exists():
+        self.transformer_path = self.artifacts_dir / "feature_pipeline.pkl"
+        if not self.model_path.exists() or not self.transformer_path.exists():
             raise FileNotFoundError(
                 "Missing model/scaler artifacts. Train the pipeline before inference."
             )
         self.model = joblib.load(self.model_path)
-        self.scaler = joblib.load(self.scaler_path)
+        self.transformer = joblib.load(self.transformer_path)
         self.extractor = SSLFeatureExtractor(config=self.config)
 
     def predict(self, audio_path: str | Path, include_waveform: bool = False) -> Dict[str, Any]:
         processed = preprocess_audio(str(audio_path), config=self.config)
         embedding = self.extractor.transform([processed], batch_size=1)
-        scaled = self.scaler.transform(embedding)
+        acoustic_values, _ = compute_acoustic_features(processed, self.config.sample_rate)
+        if acoustic_values.size:
+            acoustic_values = acoustic_values.reshape(1, -1)
+            features = np.hstack([embedding, acoustic_values])
+        else:
+            features = embedding
+        scaled = self.transformer.transform(features)
         probability = float(self.model.predict_proba(scaled)[:, 1][0])
         result: Dict[str, Any] = {
             "probability": probability,

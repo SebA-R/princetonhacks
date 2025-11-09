@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-size",
         type=float,
-        default=0.2,
+        default=0.1,
         help="Holdout split fraction.",
     )
     parser.add_argument(
@@ -57,8 +57,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=18,
         help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["xgb", "svm", "logistic"],
+        default="xgb",
+        help="Base classifier to use for training.",
     )
     return parser.parse_args()
 
@@ -75,6 +82,7 @@ def main() -> None:
         test_size=args.test_size,
         cv_folds=args.cv_folds,
         random_seed=args.seed,
+        model_type=args.model_type,
     )
     artifact_paths = run_training_pipeline(config=config)
     print("Training complete. Saved artifacts:")
@@ -83,4 +91,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
